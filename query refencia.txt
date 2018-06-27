@@ -1,0 +1,392 @@
+--PROCEDURES REFENCES--ASIGNACION DE CUENTAS 
+create or replace PROCEDURE spyn_assign_rdv 
+(
+    in_usercode  IN VARCHAR2,
+    IN_AUDITORS  IN VARCHAR2,
+    resultset    OUT types.cursortype
+)
+-- =============================================
+-- Author:  Yunior Laureano
+-- Create date: 22/05/2018
+-- Description: 
+-- =============================================
+ AS
+    TYPE t_auditor IS TABLE OF varchar2(10)
+    INDEX BY PLS_INTEGER;
+    array_auditors t_auditor;
+
+    var_array_count NUMBER(5);
+    var_index_count NUMBER(5);
+
+    CURSOR c_cuentas(prm_minchrginamnt number, prm_maxchrginamnt number) IS
+        SELECT
+            MAX(genrepd.order_no) order_no,
+            genrepd.order_id order_id
+        FROM
+            sales_order genrepd
+        WHERE
+            genrepd.sales_date <= (SYSDATE - 1)
+            AND genrepd.sales_date >= (
+                SELECT
+                    MAX(genrepd.sales_date)
+                FROM
+                    sales_order genrepd
+                WHERE
+                    EXISTS (
+                                SELECT
+                                    1
+                                FROM
+                                    sra_sales_order_assignments assign
+                                WHERE
+                                        assign.order_id = genrepd.order_id
+                                    AND assign.order_no = genrepd.order_no
+                                    AND assign.status = 'A'
+                            )
+            )
+            AND genrepd.status_id IN (4) -- Filtros que hacen los analistas de SAC en el excel.
+            AND genrepd.call_id IS NOT NULL
+            AND NOT EXISTS (  -- No asignadas
+                            SELECT
+                                1
+                            FROM
+                                sra_sales_order_assignments assign
+                            WHERE
+                                    assign.order_id = genrepd.order_id
+                                AND assign.order_no = genrepd.order_no
+                                AND assign.status = 'A'
+                            )
+        --EXCLUYENDO CUENTAS QUE YA HABIAN SIDO AUDITADAS ANTERIORMENTE.
+            AND NOT EXISTS (
+                            SELECT
+                                1
+                            FROM
+                                sra_sales_order_assignments ass
+                                JOIN sra_sales_order_audits aud ON
+                                    aud.assign_id = ass.assign_id
+                                AND aud.status IN ('A')
+                                JOIN sales_order grd ON
+                                    ass.order_id = grd.order_id
+                                AND ass.order_no = grd.order_no
+                                AND ass.status = 'A'
+                            WHERE
+                                    aud.result = 1 --AUDITORIA VALIDA
+                                AND grd.sales_date < genrepd.sales_date
+                                AND grd.account_id = genrepd.account_id
+                                AND grd.call_id = genrepd.call_id
+                                AND nvl(grd.charge_in,0) = nvl(genrepd.charge_in,0)
+                           )
+            AND NOT EXISTS (
+                    SELECT
+                        1
+                    FROM
+                        sra_exceptions_vw ex
+                    WHERE
+                            ex.rep_sales_date = genrepd.sales_date
+                        AND ex.rep_account_id = genrepd.account_id
+                        AND ex.canv_code = genrepd.canv_code
+                        AND ex.canv_edition = genrepd.canv_edition
+                )
+        GROUP BY
+            genrepd.account_id,
+            genrepd.canv_code,
+            genrepd.canv_edition,
+            genrepd.employee_id,
+            genrepd.sales_date,
+            genrepd.order_id
+        HAVING
+            MAX(charge_in) BETWEEN prm_minchrginamnt AND prm_maxchrginamnt;
+BEGIN
+
+    delete from tt_auditors;--Clean the  table
+
+    COMMIT;
+
+    INSERT INTO tt_auditors --split comma separeted auditors, and inserted into tt_auditors
+        select 
+            regexp_substr(IN_AUDITORS,'[^,]+', 1, level) AS AUDITOR
+        from 
+            dual
+        connect by regexp_substr(IN_AUDITORS, '[^,]+', 1, level) is not null;
+
+    COMMIT;
+
+    --Fill the array
+    SELECT *
+        BULK COLLECT INTO array_auditors
+    FROM tt_auditors;
+
+
+    var_array_count := array_auditors.COUNT;--The amount of autors in the array
+    var_index_count := 0; --The position of n auditor in the array
+
+    FOR ct IN c_cuentas(1, 3000) LOOP --iterate the available account for assigning
+
+        var_index_count := var_index_count + 1;
+
+        INSERT INTO sra_sales_order_assignments 
+                            (
+                                 order_id
+                                ,order_no
+                                ,auditor
+                                ,status
+                                ,creation_date
+                                ,created_by
+                                ,update_date
+                                ,updated_by 
+                            ) 
+                     VALUES (
+                                ct.order_id
+                               ,ct.order_no
+                               ,array_auditors(var_index_count) --The auditor in the specified index of the array
+                               ,'A'
+                               ,SYSDATE
+                               ,in_usercode
+                               ,SYSDATE
+                               ,in_usercode 
+                           );
+
+
+
+        IF MOD(var_index_count, var_array_count) = 0 THEN
+            var_index_count := 0;
+        END IF;
+
+    END LOOP;
+
+    COMMIT;
+
+    --CLOSE c_cuentas;
+
+    OPEN resultset FOR
+        SELECT 
+            employee.USR_NOMBRE,
+            max(orass.STATUS) as STATUS,
+            to_char(genrepd.SALES_DATE, 'dd/mm/yyyy') FECHA_VENTA,
+            count(*) AS CANTIDAD
+        FROM 
+            sra_sales_order_assignments orass
+            JOIN sales_order genrepd
+                ON orass.ORDER_ID = genrepd.ORDER_ID
+                   AND orass.ORDER_NO = genrepd.ORDER_NO
+            JOIN ARTESG.INTRANET_EMPLOYEES employee
+                ON orass.AUDITOR = employee.USR_CODIGO
+        WHERE 
+            TRUNC(orass.CREATION_DATE) = TRUNC(SYSDATE)
+            AND orass.STATUS = 'A'  
+        GROUP BY 
+            employee.USR_NOMBRE,
+            genrepd.SALES_DATE
+        HAVING
+            MAX(charge_in) BETWEEN 1 AND 3000;
+
+END;
+
+-------------------------APP FINANCE----------------------------------------------
+----------------------------------------------------------------------------------
+create or replace package body pkg_appsfinance 
+as
+    PROCEDURE sp_add_cviewer_detail(in_statement clob, in_tran_vence_type varchar2)
+    as 
+          Type curs is ref cursor;
+          cviewer_cursor curs;
+
+          var_subscr_id        CVIEWER_DUE_INV_AGING.SUBSCR_ID%TYPE;
+          var_TRX_NUMBER       CVIEWER_DUE_INV_AGING.TRX_NUMBER%TYPE;
+          var_TRX_DATE         CVIEWER_DUE_INV_AGING.TRX_DATE%TYPE;
+          var_DUE_DATE         CVIEWER_DUE_INV_AGING.DUE_DATE%TYPE;
+          var_AMOUNT           CVIEWER_DUE_INV_AGING.AMOUNT%TYPE;
+          var_REMAINING        CVIEWER_DUE_INV_AGING.REMAINING%TYPE;
+    begin
+        open cviewer_cursor for  in_statement;
+
+        loop
+
+            FETCH cviewer_cursor INTO 
+                  var_subscr_id,
+                  var_TRX_NUMBER,
+                  var_TRX_DATE,
+                  var_DUE_DATE,
+                  var_AMOUNT,
+                  var_REMAINING;
+
+            EXIT WHEN cviewer_cursor%NOTFOUND;
+
+            INSERT INTO ybrds_prod.CVIEWER_DUE_INV_AGING(
+                SUBSCR_ID, TRX_NUMBER, TRX_DATE, 
+                DUE_DATE, AMOUNT, REMAINING, TRAN_VENCE_TYPE)
+            VALUES(
+                var_subscr_id ,
+                var_TRX_NUMBER,
+                var_TRX_DATE,
+                var_DUE_DATE,
+                var_AMOUNT,
+                var_REMAINING,
+                in_tran_vence_type);
+         end loop;
+
+         close cviewer_cursor;
+
+    end;
+
+    PROCEDURE cViewer_add_cust_resumen(in_statement clob)
+    as 
+        TYPE cur_type IS REF CURSOR;
+        cur_cust_resume cur_type;
+
+        var_subscr_id           CVIEWER_CUST_INV_AGING.SUBSCR_ID%type;
+        var_CUSTOMER_NAME       CVIEWER_CUST_INV_AGING.CUSTOMER_NAME%type;
+        var_CUSTOMER_NUMBER     CVIEWER_CUST_INV_AGING.CUSTOMER_NUMBER%type;
+        var_COLLECTOR_NAME      CVIEWER_CUST_INV_AGING.COLLECTOR_NAME%type;
+        var_OUTSTANDING_AMOUNT  NUMBER;
+        var_CORRIENTE           NUMBER;
+        var_DUE_30              NUMBER;
+        var_DUE_60              NUMBER;
+        var_DUE_90              NUMBER;
+        var_DUE_120             NUMBER;
+        var_OVER_120            NUMBER;
+        var_tran_type           CVIEWER_CUST_INV_AGING.TRAN_TYPE%type;
+    begin
+
+        open cur_cust_resume for in_statement;
+
+        loop
+            fetch cur_cust_resume into
+                      var_CUSTOMER_NAME,
+                      var_CUSTOMER_NUMBER,
+                      var_COLLECTOR_NAME,
+                      var_OUTSTANDING_AMOUNT,
+                      var_CORRIENTE,
+                      var_DUE_30,
+                      var_DUE_60,
+                      var_DUE_90,
+                      var_DUE_120,
+                      var_OVER_120,
+                      var_tran_type;
+
+             exit when cur_cust_resume%notfound;
+
+             INSERT INTO ybrds_prod.CVIEWER_CUST_INV_AGING(
+                        SUBSCR_ID, CUSTOMER_NAME, CUSTOMER_NUMBER, 
+                        COLLECTOR_NAME, OUTSTANDING_AMOUNT, CORRIENTE, 
+                        DUE_30, DUE_60, DUE_90, DUE_120, OVER_120, TRAN_TYPE) 
+               VALUES(var_CUSTOMER_NUMBER   ,
+                      var_CUSTOMER_NAME     ,
+                      var_CUSTOMER_NUMBER   ,
+                      var_COLLECTOR_NAME    ,
+                      var_OUTSTANDING_AMOUNT,
+                      var_CORRIENTE         ,
+                      var_DUE_30            ,
+                      var_DUE_60            ,
+                      var_DUE_90            ,
+                      var_DUE_120           ,
+                      var_OVER_120          ,
+                      var_tran_type)        ;
+
+        end loop;
+
+        close cur_cust_resume;
+    end;
+
+    PROCEDURE cViewer_add_collector_detail(in_statement clob)
+    as
+         TYPE cur_type is ref cursor;
+         collector_cur cur_type;
+
+         var_int_SUBSCR_ID NUMBER;
+         var_int_TRAN_SEQ  NUMBER;
+         var_str_NAME      CVIEWER_collector_info.name%type;
+         var_dte_CALL_DATE date;
+         var_str_CONTACT   CVIEWER_collector_info.contact%type;
+    begin
+
+        open collector_cur for in_statement;
+
+        loop
+            fetch collector_cur into
+                 var_int_SUBSCR_ID,
+                 var_int_TRAN_SEQ,
+                 var_str_NAME,
+                 var_dte_CALL_DATE,
+                 var_str_CONTACT;
+
+            exit when collector_cur%notfound;
+
+            INSERT INTO ybrds_prod.CVIEWER_collector_info
+                 (SUBSCR_ID, tran_seq, name, call_date, contact)
+            VALUES (var_int_SUBSCR_ID, var_int_TRAN_SEQ, var_str_NAME, var_dte_CALL_DATE, var_str_CONTACT);
+        end loop;
+
+        close collector_cur;
+    end;
+
+    PROCEDURE cViewer_add_payment_detail(in_statement clob)
+    as
+        TYPE cur_type is ref cursor;
+        payment_cur cur_type;
+        
+        var_subscr_id        number;
+        var_collector_id     number;
+        var_profile_name     CVIEWER_payment_info.profile_name%type;
+        var_collector_name   CVIEWER_payment_info.collector_name%type;
+        var_due_date         date;
+        var_gl_date          date;
+        var_pay_date         date;
+        var_monto            number;
+    begin
+
+        open payment_cur for in_statement;
+
+        loop
+            fetch payment_cur into
+                var_subscr_id,
+                var_collector_id,
+                var_profile_name,
+                var_collector_name,
+                var_due_date,
+                var_gl_date,
+                var_pay_date,
+                var_monto;
+
+             exit when payment_cur%notfound;
+
+             INSERT INTO ybrds_prod.CVIEWER_payment_info
+               (subscr_id,
+                collector_id,
+                profile_name,
+                collector_name,
+                due_date,
+                gl_date,
+                pay_date,
+                amount)
+             VALUES
+                (var_subscr_id,
+                var_collector_id,
+                var_profile_name,
+                var_collector_name,
+                var_due_date,
+                var_gl_date,
+                var_pay_date,
+                var_monto);
+        end loop;
+
+        close payment_cur;
+
+    end;
+
+    PROCEDURE sp_delete_due_inv_aging
+    AS BEGIN
+        delete from CVIEWER_DUE_INV_AGING;
+        COMMIT;
+    END;
+
+    PROCEDURE sp_del_cust_collectr_paymnt
+    AS BEGIN
+        delete from CVIEWER_CUST_INV_AGING;
+        delete from CVIEWER_collector_info;
+        delete from CVIEWER_payment_info;
+        COMMIT;
+    END;
+
+end;
+
+
